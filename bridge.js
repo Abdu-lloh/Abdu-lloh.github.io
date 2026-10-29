@@ -856,7 +856,22 @@
         var sReels = await pg('reels?select=id&limit=10000').catch(function () { return []; });
         return jsonRes({ ok: true, users: sUsers.length, series: sSeries.length, movies: sMovies.length, reels: sReels.length });
       }
-      if (path === '/api/send-episode') return jsonRes({ error: 'The bot link is asleep right now — the server sends episodes.' }, 503);
+      if (path === '/api/send-episode') {
+        // Serverless Send: the live bot polls Supabase for send
+        // requests and sends the file itself — the old route asked the
+        // hosted server, which is gone. Needs a Telegram identity to
+        // send INTO: the Mini App body carries it; a Telegram/phone-
+        // linked app session's uid IS the Telegram id.
+        var sendEpId = body && (body.episode_id || body.episodeId);
+        var sendTg = 0;
+        if (body && body.telegram_id && /^\d+$/.test(String(body.telegram_id))) sendTg = Number(body.telegram_id);
+        if (!sendTg && /^\d+$/.test(String(uid))) sendTg = Number(uid);
+        if (!sendEpId) return jsonRes({ ok: false, error: 'No episode specified.' });
+        if (!sendTg) return jsonRes({ ok: false, error: 'Link your Telegram in the bot first — then Send works.' });
+        var sendKey = 'sendreq:' + Date.now() + '-' + Math.floor(Math.random() * 1e6);
+        await pg('meta', { method: 'POST', body: { key: sendKey, value: JSON.stringify({ episode_id: Number(sendEpId), telegram_id: sendTg }) } });
+        return jsonRes({ ok: true });
+      }
       if (path.indexOf('/api/admin/') === 0) {
         var adm = await adminRoute(method, path, seg, uid, body);
         if (adm) return adm;
@@ -914,6 +929,45 @@
     };
     new MutationObserver(function () { hideMtCard(); hideDeadUploads(); })
       .observe(document.documentElement, { childList: true, subtree: true });
+  } catch (e) {}
+
+  // Playback diagnostics (vc130): record what <video> elements report —
+  // errors, stalls, first playable frame — into the same meta diag log
+  // the shell writes, so a frozen player names its own fault. Recording
+  // only; playback behavior is unchanged.
+  try {
+    var diagPost = function (kind, detail) {
+      try {
+        pg('meta', { method: 'POST', body: { key: 'diag:' + Date.now() + '-' + Math.floor(Math.random() * 100000), value: kind + '|' + detail } }).catch(function () {});
+      } catch (e) {}
+    };
+    var tagVideo = function (v) {
+      if (!v || v.__tsDiag) return;
+      v.__tsDiag = true;
+      var waits = 0;
+      var szOf = function () {
+        var m = /[?&]sz=(\d+)/.exec(v.currentSrc || v.src || '');
+        return m ? m[1] : '?';
+      };
+      v.addEventListener('error', function () {
+        var e = v.error;
+        diagPost('verr', 'sz=' + szOf() + ' code=' + (e ? e.code : '?') + ' net=' + v.networkState + ' ready=' + v.readyState);
+      });
+      v.addEventListener('stalled', function () {
+        if (++waits <= 8) diagPost('vstalled', 'sz=' + szOf() + ' ready=' + v.readyState + ' net=' + v.networkState);
+      });
+      v.addEventListener('waiting', function () {
+        if (++waits <= 8) diagPost('vwaiting', 'sz=' + szOf() + ' ready=' + v.readyState + ' net=' + v.networkState);
+      });
+      v.addEventListener('canplay', function () { diagPost('vcanplay', 'sz=' + szOf() + ' dur=' + Math.round(v.duration || 0)); });
+      v.addEventListener('playing', function () { diagPost('vplaying', 'sz=' + szOf()); });
+    };
+    var tagVideos = function () {
+      var vs = document.querySelectorAll('video');
+      for (var i = 0; i < vs.length; i++) tagVideo(vs[i]);
+    };
+    new MutationObserver(tagVideos).observe(document.documentElement, { childList: true, subtree: true });
+    tagVideos();
   } catch (e) {}
 
   window.fetch = function (input, init) {
